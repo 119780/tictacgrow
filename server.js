@@ -72,7 +72,7 @@ function applyMove(state, role, data) {
   if (state.curP !== expectedP)          return {ok:false, error:'Not your turn'};
 
   const {cells} = state;
-  const sym = state.curP===1 ? 'X' : 'O';
+  const sym = state.curP===1 ? 'x' : 'o';
 
   // ── TIC ──────────────────────────────────────────────────
   if (data.action === 'tic') {
