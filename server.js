@@ -72,7 +72,7 @@ function applyMove(state, role, data) {
   if (state.curP !== expectedP)          return {ok:false, error:'Not your turn'};
 
   const {cells} = state;
-  const sym = state.curP===1 ? 'x' : 'o';
+  const sym = state.curP===1 ? 'X' : 'O';
 
   // ── TIC ──────────────────────────────────────────────────
   if (data.action === 'tic') {
@@ -167,7 +167,8 @@ function handleJoin(ws, rawCode) {
   room.p2      = ws;
   ws.roomCode  = code;
   ws.role      = 'guest';
-  room.state   = freshState(); // fresh game for both
+  room.state   = freshState();
+  room.rematchVotes = new Set(); // fresh game for both
 
   send(ws,     {type:'joined',          role:'guest', state:room.state});
   send(room.p1,{type:'opponent-joined', role:'host',  state:room.state});
@@ -186,19 +187,56 @@ function handleMove(ws, data) {
   broadcast(room, {type:'state', state:room.state, move:moveInfo});
 }
 
-function handleReset(ws) {
-  const room = rooms[ws.roomCode];
+function handleResign(ws) {
+  const code = ws.roomCode;
+  const room = rooms[code];
   if (!room) return;
-  room.state = freshState();
-  broadcast(room, {type:'reset', state:room.state});
-  console.log(`Room ${room.code} reset`);
+  if (!room.state.over) {
+    const other = room.p1===ws ? room.p2 : room.p1;
+    send(other, {type:'opponent-resigned'});
+  }
+  if (room.p1===ws) room.p1=null; else room.p2=null;
+  if (!room.p1 && !room.p2) delete rooms[code];
+  ws.roomCode = null; // prevents handleDisconnect from double-firing
+  console.log(`Room ${code} — player resigned`);
+}
+
+function handleRematchRequest(ws) {
+  const room = rooms[ws.roomCode];
+  if (!room || !room.state.over) return;
+  room.rematchVotes = room.rematchVotes || new Set();
+  room.rematchVotes.add(ws.role);
+  broadcast(room, {type:'rematch-status', votes: Array.from(room.rematchVotes)});
+  if (room.rematchVotes.has('host') && room.rematchVotes.has('guest')) {
+    room.state = freshState();
+    room.rematchVotes = new Set();
+    broadcast(room, {type:'reset', state:room.state});
+    console.log(`Room ${room.code} — rematch started`);
+  }
+}
+
+function handleLeave(ws) {
+  const code = ws.roomCode;
+  const room = rooms[code];
+  if (!room) return;
+  const other = room.p1===ws ? room.p2 : room.p1;
+  send(other, {type:'opponent-left'});
+  if (room.p1===ws) room.p1=null; else room.p2=null;
+  if (!room.p1 && !room.p2) delete rooms[code];
+  ws.roomCode = null; // prevents handleDisconnect from double-firing
+  console.log(`Room ${code} — player left`);
 }
 
 function handleDisconnect(ws) {
+  if (!ws.roomCode) return; // already cleaned up by resign/leave
   const room = rooms[ws.roomCode];
   if (!room) return;
   const other = room.p1===ws ? room.p2 : room.p1;
-  send(other, {type:'opponent-disconnected'});
+  if (!room.state.over) {
+    // Game was live — treat drop as resign
+    send(other, {type:'opponent-resigned'});
+  }
+  // If game was already over, silent drop — let the other player click "Go to Dashboard"
   if (room.p1===ws) room.p1=null; else room.p2=null;
   if (!room.p1 && !room.p2) {
     delete rooms[ws.roomCode];
@@ -220,11 +258,13 @@ wss.on('connection', ws => {
   ws.on('message', raw => {
     let data;
     try { data = JSON.parse(raw); } catch(e) { return; }
-    if (data.type==='ping')   { send(ws,{type:'pong'}); return; }
-    if (data.type==='create') handleCreate(ws);
-    else if (data.type==='join')  handleJoin(ws, data.code);
-    else if (data.type==='move')  handleMove(ws, data);
-    else if (data.type==='reset') handleReset(ws);
+    if (data.type==='ping')            { send(ws,{type:'pong'}); return; }
+    if (data.type==='create')          handleCreate(ws);
+    else if (data.type==='join')            handleJoin(ws, data.code);
+    else if (data.type==='move')            handleMove(ws, data);
+    else if (data.type==='resign')          handleResign(ws);
+    else if (data.type==='rematch-request') handleRematchRequest(ws);
+    else if (data.type==='leave')           handleLeave(ws);
   });
 
   ws.on('close', () => handleDisconnect(ws));
