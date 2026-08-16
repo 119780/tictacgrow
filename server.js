@@ -204,6 +204,7 @@ function handleResign(ws) {
 function handleRematchRequest(ws) {
   const room = rooms[ws.roomCode];
   if (!room || !room.state.over) return;
+  if (!room.p1 || !room.p2) { send(ws,{type:'opponent-left'}); return; } // opponent gone
   room.rematchVotes = room.rematchVotes || new Set();
   room.rematchVotes.add(ws.role);
   broadcast(room, {type:'rematch-status', votes: Array.from(room.rematchVotes)});
@@ -235,8 +236,10 @@ function handleDisconnect(ws) {
   if (!room.state.over) {
     // Game was live — treat drop as resign
     send(other, {type:'opponent-resigned'});
+  } else {
+    // Game already ended — grey out their rematch option, don't force navigation
+    send(other, {type:'opponent-left'});
   }
-  // If game was already over, silent drop — let the other player click "Go to Dashboard"
   if (room.p1===ws) room.p1=null; else room.p2=null;
   if (!room.p1 && !room.p2) {
     delete rooms[ws.roomCode];
