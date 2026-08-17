@@ -53,7 +53,9 @@ function freshState() {
   for (let x=0; x<3; x++)
     for (let y=0; y<3; y++)
       setC(cells, x, y, {hasBox:true, blackedOut:false, symbol:null});
-  return {cells, curP:1, over:false, winCells:[]};
+  // Randomize who goes first — not always the host.
+  const curP = Math.random() < 0.5 ? 1 : 2;
+  return {cells, curP, over:false, winCells:[]};
 }
 
 function isAdjOrDiag(ax,ay,bx,by) {
@@ -189,6 +191,7 @@ async function recordMatchResult(room, winnerRole, reason) {
       player2_id: guestUserId,
       winner_id: winnerId,
       ended_reason: reason,
+      ranked: !!room.ranked,
     });
     await supabase.rpc('record_match_result', { p_winner: winnerId, p_loser: loserId });
   } catch (e) {
@@ -226,7 +229,7 @@ function releaseRoom(code, room) {
 //  MESSAGE HANDLERS
 // ═══════════════════════════════════════════════════════════════
 
-async function handleCreate(ws, token) {
+async function handleCreate(ws, token, wantsRanked) {
   const user = await resolveUser(token);
   ws.userId   = user?.id || null;
   ws.userName = user?.name || genGuestName();
@@ -239,14 +242,19 @@ async function handleCreate(ws, token) {
     guestRoomCount++;
   }
 
+  // Ranked play requires a signed-in host — never trust the client flag
+  // alone. Elo isn't computed yet (see recordMatchResult), this just
+  // tags the room/match so ranked infrastructure is ready to plug in.
+  const ranked = !!(wantsRanked && user);
+
   let code;
   let tries = 0;
   do { code = genCode(); tries++; } while (rooms[code] && tries < 100);
-  rooms[code] = {p1:ws, p2:null, state:freshState(), code, rematchVotes:new Set(), isGuestRoom:!user};
+  rooms[code] = {p1:ws, p2:null, state:freshState(), code, rematchVotes:new Set(), isGuestRoom:!user, ranked};
   ws.roomCode = code;
   ws.role     = 'host';
-  send(ws, {type:'created', code});
-  console.log(`Room ${code} created by ${ws.userName}${user?' (signed in)':' (guest)'}`);
+  send(ws, {type:'created', code, ranked});
+  console.log(`Room ${code} created by ${ws.userName}${user?' (signed in)':' (guest)'}${ranked?' [ranked]':''}`);
 }
 
 async function handleJoin(ws, rawCode, token) {
@@ -370,7 +378,7 @@ wss.on('connection', ws => {
     let data;
     try { data = JSON.parse(raw); } catch(e) { return; }
     if (data.type==='ping')                 { send(ws,{type:'pong'}); return; }
-    if (data.type==='create')               await handleCreate(ws, data.token);
+    if (data.type==='create')               await handleCreate(ws, data.token, data.ranked);
     else if (data.type==='join')            await handleJoin(ws, data.code, data.token);
     else if (data.type==='move')            await handleMove(ws, data);
     else if (data.type==='resign')          await handleResign(ws);
