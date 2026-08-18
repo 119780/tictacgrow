@@ -121,9 +121,11 @@ function applyMove(state, role, data) {
     const seen = new Set();
     for (const p of placements) {
       const key = K(p.x,p.y);
+      const target = getC(cells,p.x,p.y);
       if (seen.has(key))                          return {ok:false, error:'Duplicate placement'};
       if (!isAdjOrDiag(ox,oy,p.x,p.y))           return {ok:false, error:`(${p.x},${p.y}) is not adjacent/diagonal to origin`};
-      if (getC(cells,p.x,p.y).hasBox)             return {ok:false, error:`(${p.x},${p.y}) already has a box`};
+      if (target.hasBox)                          return {ok:false, error:`(${p.x},${p.y}) already has a box`};
+      if (target.blackedOut)                      return {ok:false, error:`(${p.x},${p.y}) is blacked out — cannot grow there`};
       seen.add(key);
     }
     for (const p of placements) setC(cells,p.x,p.y,{hasBox:true,blackedOut:false,symbol:null});
@@ -176,6 +178,39 @@ async function resolveUser(token) {
 //  STATS / MATCH RECORDING  (signed-in players only)
 // ═══════════════════════════════════════════════════════════════
 
+// ── Hidden Elo — never surfaced as a raw number anywhere. The only
+// user-facing artifact is a sorted ladder position ("N ELO"), computed
+// client-side by ordering everyone's stats.elo_rating. Standard Elo
+// math, K=32, applied only for ranked matches where BOTH players are
+// signed in — a match involving any guest never touches elo_rating.
+const ELO_K = 32;
+const ELO_DEFAULT = 1200;
+
+function computeElo(winnerRating, loserRating) {
+  const expectedWinner = 1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
+  const expectedLoser  = 1 - expectedWinner;
+  return {
+    newWinner: Math.round(winnerRating + ELO_K * (1 - expectedWinner)),
+    newLoser:  Math.round(loserRating  + ELO_K * (0 - expectedLoser)),
+  };
+}
+
+async function updateEloIfEligible(room, winnerId, loserId) {
+  // Ranked-only, and both sides must be real signed-in accounts —
+  // a guest opponent (or a casual room) never affects elo_rating.
+  if (!room.ranked || !winnerId || !loserId) return;
+  try {
+    const { data: rows } = await supabase.from('stats').select('user_id, elo_rating').in('user_id', [winnerId, loserId]);
+    const winnerElo = rows?.find(r => r.user_id === winnerId)?.elo_rating ?? ELO_DEFAULT;
+    const loserElo  = rows?.find(r => r.user_id === loserId )?.elo_rating ?? ELO_DEFAULT;
+    const { newWinner, newLoser } = computeElo(winnerElo, loserElo);
+    await supabase.from('stats').update({ elo_rating: newWinner }).eq('user_id', winnerId);
+    await supabase.from('stats').update({ elo_rating: newLoser  }).eq('user_id', loserId);
+  } catch (e) {
+    console.error('Elo update failed:', e.message);
+  }
+}
+
 async function recordMatchResult(room, winnerRole, reason) {
   if (!supabase) return;
   const hostUserId  = room.p1?.userId  || null;
@@ -193,7 +228,11 @@ async function recordMatchResult(room, winnerRole, reason) {
       ended_reason: reason,
       ranked: !!room.ranked,
     });
+    // record_match_result upserts stats rows for both players first (with
+    // the elo_rating column's 1200 default on first insert), so by the
+    // time updateEloIfEligible reads them, both rows are guaranteed to exist.
     await supabase.rpc('record_match_result', { p_winner: winnerId, p_loser: loserId });
+    await updateEloIfEligible(room, winnerId, loserId);
   } catch (e) {
     console.error('Supabase match record failed:', e.message);
   }
