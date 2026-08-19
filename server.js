@@ -215,7 +215,11 @@ async function recordMatchResult(room, winnerRole, reason) {
   if (!supabase) return;
   const hostUserId  = room.p1?.userId  || null;
   const guestUserId = room.p2?.userId || null;
-  if (!hostUserId && !guestUserId) return; // both guests — nothing to persist
+  // Only record a match when BOTH players are signed-in accounts. A match
+  // involving any guest is not persisted at all — no matches row, no
+  // stats update, nothing — so guest play can never pollute win/loss
+  // records or leave a null-opponent entry behind.
+  if (!hostUserId || !guestUserId) return;
 
   const winnerId = winnerRole==='host' ? hostUserId  : guestUserId;
   const loserId  = winnerRole==='host' ? guestUserId : hostUserId;
