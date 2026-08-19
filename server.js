@@ -26,13 +26,30 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 // ── Active rooms ──────────────────────────────────────────────
-// roomCode (6-char uppercase) → { p1, p2, state, code, rematchVotes, isGuestRoom }
+// roomCode (6-char uppercase) → { p1, p2, state, code, rematchVotes, isGuestRoom, ranked, grace }
 const rooms = {};
 
 // Guest room cap — protects free-tier server resources.
 // Signed-in hosts are NOT counted against this at all.
 const MAX_GUEST_ROOMS = 20;
 let guestRoomCount = 0;
+
+// ── Reconnect grace period ──────────────────────────────────────
+// An unintentional drop (wifi blip, closed laptop) doesn't instantly
+// forfeit — the room stays alive for GRACE_MS and the disconnected
+// player can rejoin via the client's "Currently Playing" button.
+// Deliberate exits (forfeit button, resign, leaving after a finished
+// game) skip this entirely and resolve immediately.
+const GRACE_MS = 60000;
+
+// ── Matchmaking queues ──────────────────────────────────────────
+// Two independent queues (ranked/unranked), each matched by elo
+// proximity that widens the longer someone waits.
+let matchQueueRanked   = []; // [{ws, elo, queuedAt}]
+let matchQueueUnranked = [];
+const MM_BASE_RANGE      = 100; // starting elo window
+const MM_GROWTH_PER_SEC  = 15;  // window widens by this per second waited
+const MM_TICK_MS         = 2000;
 
 // ═══════════════════════════════════════════════════════════════
 //  GAME LOGIC  (authoritative — mirrors the client)
@@ -262,11 +279,113 @@ function broadcast(room, data) {
   send(room.p2, data);
 }
 
-// Call whenever a room is fully torn down, to release its guest-cap slot.
+// Call whenever a room is fully torn down, to release its guest-cap slot
+// and cancel any pending reconnect-grace timers so they can't fire late.
 function releaseRoom(code, room) {
   if (room.isGuestRoom) guestRoomCount = Math.max(0, guestRoomCount-1);
+  if (room.grace) {
+    if (room.grace.host?.timer)  clearTimeout(room.grace.host.timer);
+    if (room.grace.guest?.timer) clearTimeout(room.grace.guest.timer);
+  }
   delete rooms[code];
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  MATCHMAKING — elo-proximity queues, ranked & unranked
+// ═══════════════════════════════════════════════════════════════
+
+function removeFromQueues(ws) {
+  matchQueueRanked   = matchQueueRanked.filter(e => e.ws !== ws);
+  matchQueueUnranked = matchQueueUnranked.filter(e => e.ws !== ws);
+  ws.inQueue = false;
+}
+
+function broadcastQueueStats() {
+  const stats = {
+    type: 'queue-stats',
+    online: wss.clients.size,
+    rankedQueue: matchQueueRanked.length,
+    unrankedQueue: matchQueueUnranked.length,
+  };
+  wss.clients.forEach(c => send(c, stats));
+}
+
+async function handleFindMatch(ws, token, ranked) {
+  const user = await resolveUser(token);
+  if (ranked && !user) {
+    send(ws, {type:'error', message:'Sign in to use ranked matchmaking.'});
+    return;
+  }
+  ws.userId   = user?.id || null;
+  ws.userName = user?.name || ws.userName || genGuestName();
+
+  let elo = ELO_DEFAULT;
+  if (user && supabase) {
+    try {
+      const { data } = await supabase.from('stats').select('elo_rating').eq('user_id', user.id).maybeSingle();
+      if (data) elo = data.elo_rating;
+    } catch (e) { /* fall back to default */ }
+  }
+
+  removeFromQueues(ws); // in case of a duplicate find-match while already queued
+  const entry = { ws, elo, queuedAt: Date.now() };
+  ws.inQueue = true;
+  (ranked ? matchQueueRanked : matchQueueUnranked).push(entry);
+  send(ws, {type:'queued', ranked});
+  broadcastQueueStats();
+}
+
+function handleCancelMatch(ws) {
+  removeFromQueues(ws);
+  send(ws, {type:'match-cancelled'});
+  broadcastQueueStats();
+}
+
+function createMatchedRoom(a, b, ranked) {
+  const [first, second] = Math.random() < 0.5 ? [a,b] : [b,a];
+  const p1ws = first.ws, p2ws = second.ws;
+  p1ws.role = 'host';  p1ws.inQueue = false;
+  p2ws.role = 'guest'; p2ws.inQueue = false;
+
+  let code, tries = 0;
+  do { code = genCode(); tries++; } while (rooms[code] && tries < 100);
+  p1ws.roomCode = code; p2ws.roomCode = code;
+
+  rooms[code] = {p1:p1ws, p2:p2ws, state:freshState(), code, rematchVotes:new Set(), isGuestRoom:false, ranked};
+  send(p1ws, {type:'match-found', role:'host',  state:rooms[code].state, opponentName:p2ws.userName, ranked});
+  send(p2ws, {type:'match-found', role:'guest', state:rooms[code].state, opponentName:p1ws.userName, ranked});
+  console.log(`Matchmade room ${code} (${ranked?'ranked':'unranked'}): ${p1ws.userName} vs ${p2ws.userName}`);
+}
+
+function tryMatchQueue(queue, ranked) {
+  queue.sort((a,b) => a.elo - b.elo);
+  const now = Date.now();
+  let i = 0;
+  let matchedAny = false;
+  while (i < queue.length - 1) {
+    const a = queue[i], b = queue[i+1];
+    const waitedA = (now - a.queuedAt) / 1000;
+    const waitedB = (now - b.queuedAt) / 1000;
+    const allowedRange = MM_BASE_RANGE + MM_GROWTH_PER_SEC * Math.min(waitedA, waitedB);
+    if (Math.abs(a.elo - b.elo) <= allowedRange) {
+      queue.splice(i, 2);
+      createMatchedRoom(a, b, ranked);
+      matchedAny = true;
+      // don't advance i — re-check the new pair now sitting at this index
+    } else {
+      i++;
+    }
+  }
+  return matchedAny;
+}
+
+setInterval(() => {
+  const a = tryMatchQueue(matchQueueRanked, true);
+  const b = tryMatchQueue(matchQueueUnranked, false);
+  if (a || b) broadcastQueueStats();
+}, MM_TICK_MS);
+
+setInterval(broadcastQueueStats, 3000);
 
 // ═══════════════════════════════════════════════════════════════
 //  MESSAGE HANDLERS
@@ -317,8 +436,8 @@ async function handleJoin(ws, rawCode, token) {
   room.state   = freshState();
   room.rematchVotes = new Set(); // fresh game for both
 
-  send(ws,     {type:'joined',          role:'guest', state:room.state, hostName:room.p1.userName});
-  send(room.p1,{type:'opponent-joined', role:'host',  state:room.state, guestName:ws.userName});
+  send(ws,     {type:'joined',          role:'guest', state:room.state, hostName:room.p1.userName, code});
+  send(room.p1,{type:'opponent-joined', role:'host',  state:room.state, guestName:ws.userName, code});
   console.log(`Room ${code} — ${ws.userName} joined`);
 }
 
@@ -382,26 +501,90 @@ function handleLeave(ws) {
   console.log(`Room ${code} — player left`);
 }
 
+// Called when a grace period expires without the player reconnecting —
+// this is where the actual forfeit happens for an accidental drop.
+async function finalizeForfeit(code, slot) {
+  const room = rooms[code];
+  if (!room) return;
+  if (room.grace) room.grace[slot] = null;
+  if (room.state.over) return; // game already ended some other way in the meantime
+
+  const winnerRole = slot === 'host' ? 'guest' : 'host';
+  const other = winnerRole === 'host' ? room.p1 : room.p2;
+  send(other, {type:'opponent-resigned'});
+  await recordMatchResult(room, winnerRole, 'resign');
+  room.state.over = true;
+
+  if (!room.p1 && !room.p2) releaseRoom(code, room);
+}
+
 async function handleDisconnect(ws) {
-  if (!ws.roomCode) return; // already cleaned up by resign/leave
+  if (ws.inQueue) removeFromQueues(ws);
+  if (!ws.roomCode) return; // already cleaned up by resign/leave, or was never in a room
   const code = ws.roomCode;
   const room = rooms[code];
   if (!room) return;
-  const other = room.p1===ws ? room.p2 : room.p1;
+
+  const isP1 = room.p1 === ws;
+  const other = isP1 ? room.p2 : room.p1;
+
   if (!room.state.over) {
-    // Game was live — treat drop as resign
-    const winnerRole = room.p1===ws ? 'guest' : 'host';
-    send(other, {type:'opponent-resigned'});
-    await recordMatchResult(room, winnerRole, 'resign');
+    // Accidental drop mid-game — start a grace period instead of an
+    // instant forfeit. The other player is told to wait, not that they
+    // won; the room stays alive so the dropped player can rejoin.
+    const slot = isP1 ? 'host' : 'guest';
+    const meta = { userId: ws.userId, userName: ws.userName };
+    room.grace = room.grace || {};
+    if (isP1) room.p1 = null; else room.p2 = null;
+    send(other, {type:'opponent-disconnected-grace', graceMs: GRACE_MS});
+    room.grace[slot] = { ...meta, timer: setTimeout(() => finalizeForfeit(code, slot), GRACE_MS) };
   } else {
     // Game already ended — grey out their rematch option, don't force navigation
     send(other, {type:'opponent-left'});
+    if (isP1) room.p1 = null; else room.p2 = null;
   }
-  if (room.p1===ws) room.p1=null; else room.p2=null;
-  if (!room.p1 && !room.p2) {
+
+  const stillInGrace = room.grace && (room.grace.host || room.grace.guest);
+  if (!room.p1 && !room.p2 && !stillInGrace) {
     releaseRoom(code, room);
     console.log(`Room ${code} cleaned up`);
   }
+}
+
+// Reconnecting after an accidental drop. Trusts the room code + slot the
+// client remembers; if the original occupant was signed in, the new
+// connection's token must resolve to that same account.
+async function handleRejoin(ws, data) {
+  const { roomCode, role, token } = data || {};
+  const code = (roomCode || '').trim().toUpperCase().slice(0,6);
+  const room = rooms[code];
+  const slot = role === 'host' ? 'host' : role === 'guest' ? 'guest' : null;
+
+  if (!room || !slot || !room.grace || !room.grace[slot]) {
+    send(ws, {type:'error', message:'That game is no longer available to rejoin.'});
+    return;
+  }
+
+  const graceInfo = room.grace[slot];
+  const user = await resolveUser(token);
+  if (graceInfo.userId && graceInfo.userId !== (user?.id || null)) {
+    send(ws, {type:'error', message:'This game belongs to a different signed-in account.'});
+    return;
+  }
+
+  clearTimeout(graceInfo.timer);
+  room.grace[slot] = null;
+
+  ws.userId = graceInfo.userId;
+  ws.userName = graceInfo.userName;
+  ws.role = slot;
+  ws.roomCode = code;
+  if (slot === 'host') room.p1 = ws; else room.p2 = ws;
+
+  const other = slot === 'host' ? room.p2 : room.p1;
+  send(ws, {type:'rejoined', role:slot, state:room.state, opponentName: other?.userName || 'Opponent', ranked: !!room.ranked, code});
+  send(other, {type:'opponent-reconnected'});
+  console.log(`Room ${code} — ${ws.userName} reconnected as ${slot}`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -413,6 +596,7 @@ wss.on('connection', ws => {
   ws.role     = null;
   ws.userId   = null;
   ws.userName = null;
+  ws.inQueue  = false;
   ws.isAlive  = true;
 
   ws.on('pong', () => { ws.isAlive = true; });
@@ -427,6 +611,9 @@ wss.on('connection', ws => {
     else if (data.type==='resign')          await handleResign(ws);
     else if (data.type==='rematch-request') handleRematchRequest(ws);
     else if (data.type==='leave')           handleLeave(ws);
+    else if (data.type==='find-match')      await handleFindMatch(ws, data.token, data.ranked);
+    else if (data.type==='cancel-match')    handleCancelMatch(ws);
+    else if (data.type==='rejoin')          await handleRejoin(ws, data);
   });
 
   ws.on('close', () => handleDisconnect(ws));
